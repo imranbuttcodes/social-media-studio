@@ -136,3 +136,16 @@ class ScheduleSlotResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class PublishAttemptResponse(BaseModel):
+    """Response schema for a single publish attempt audit record."""
+    id: str
+    slot_id: str
+    adapter_name: str
+    status: str                     # "success" | "failed"
+    response_data: Optional[str]    # JSON string stored in DB (Text column)
+    attempted_at: datetime
+
+    class Config:
+        from_attributes = True

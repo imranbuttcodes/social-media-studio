@@ -1,18 +1,25 @@
+import json
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from app.database import Base, engine, get_db
-from app.models import Post, Variant
+from app.models import Post, Variant, ScheduleSlot, PublishAttempt
 from app.schemas import (
     PostCreate,
     PostResponse,
     VariantResponse,
     VariantCreateManual,
     VariantReviewUpdate,
+    ScheduleSlotResponse,
+    PublishAttemptResponse,
     validate_platform_constraints
 )
 from app.services.generator import fetch_url_content, generate_platform_variants
+from app.publishers.factory import get_publisher
+from app.publishers.base import PublishError
 
 
 # --- Review State Machine ---
@@ -194,3 +201,152 @@ def update_variant_status(variant_id: str, payload: VariantReviewUpdate, db: Ses
     db.commit()
     db.refresh(variant)
     return variant
+
+
+# --- Phase 4: Publisher Adapters & Idempotency ---
+
+@app.post(
+    "/api/v1/variants/{variant_id}/publish",
+    response_model=PublishAttemptResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Publishing"],
+)
+async def publish_variant(variant_id: str, db: Session = Depends(get_db)):
+    """
+    Publishes an approved variant via the appropriate mock adapter.
+
+    Idempotency guarantee:
+        The idempotency_key is derived as  `{variant_id}_{scheduled_time}`.
+        For an on-demand (immediate) publish the scheduled_time is fixed to the
+        instant the ScheduleSlot is first created.  If this endpoint is called
+        a second time with the same variant_id AND a ScheduleSlot with the same
+        key already has a *successful* PublishAttempt, the existing attempt is
+        returned unchanged — the adapter is NOT called again.
+
+    Guards:
+        - Variant must exist (404 otherwise).
+        - Variant status must be 'approved' (400 otherwise).
+        - Content must pass platform constraint validation (400 otherwise).
+    """
+    # --- Fetch variant ---
+    variant = db.query(Variant).filter(Variant.id == variant_id).first()
+    if not variant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Variant not found")
+
+    # ---  Approval guard ---
+    if variant.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Variant must be in 'approved' state to publish. "
+                f"Current status: '{variant.status}'"
+            ),
+        )
+
+    # ---  Resolve or create a ScheduleSlot (on-demand = publish now) ---
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # store as naive UTC
+    idempotency_key = f"{variant_id}_{now.strftime('%Y%m%dT%H%M%S')}"
+
+    # Check for an existing slot with a successful attempt (idempotency check).
+    existing_slot = (
+        db.query(ScheduleSlot)
+        .filter(ScheduleSlot.variant_id == variant_id)
+        .filter(ScheduleSlot.idempotency_key == idempotency_key)
+        .first()
+    )
+    if existing_slot:
+        successful_attempt = (
+            db.query(PublishAttempt)
+            .filter(PublishAttempt.slot_id == existing_slot.id)
+            .filter(PublishAttempt.status == "success")
+            .first()
+        )
+        if successful_attempt:
+            # Idempotent: return the existing successful attempt unchanged.
+            return successful_attempt
+
+    # No existing successful attempt — proceed.
+    slot = ScheduleSlot(
+        variant_id=variant_id,
+        scheduled_time=now,
+        idempotency_key=idempotency_key,
+        status="processing",
+    )
+    db.add(slot)
+    db.commit()
+    db.refresh(slot)
+
+    # ---  Parse hashtags (stored as JSON string in DB) ---
+    try:
+        hashtags: list[str] = json.loads(variant.hashtags) if variant.hashtags else []
+    except (json.JSONDecodeError, TypeError):
+        hashtags = []
+
+    # --- Call adapter ---
+    adapter = get_publisher(variant.platform)
+    try:
+        response_data = await adapter.publish(
+            content=variant.content,
+            hashtags=hashtags,
+            idempotency_key=idempotency_key,
+        )
+        attempt_status = "success"
+        response_json = json.dumps(response_data)
+
+        # Mark slot completed and variant published.
+        slot.status = "completed"
+        variant.status = "published"
+
+    except PublishError as exc:
+        attempt_status = "failed"
+        response_json = json.dumps({"error": str(exc)})
+        slot.status = "failed"
+        # Variant stays 'approved' so the reviewer can retry.
+
+    # --- 6. Persist PublishAttempt (evidence) ---
+    attempt = PublishAttempt(
+        slot_id=slot.id,
+        adapter_name=adapter.adapter_name,
+        status=attempt_status,
+        response_data=response_json,
+    )
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+
+    if attempt_status == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Publishing failed: {response_json}",
+        )
+
+    return attempt
+
+
+@app.get(
+    "/api/v1/variants/{variant_id}/attempts",
+    response_model=List[PublishAttemptResponse],
+    tags=["Publishing"],
+)
+def list_publish_attempts(variant_id: str, db: Session = Depends(get_db)):
+    """
+    Lists all publish attempts (evidence records) for a given variant,
+    ordered from most recent to oldest.
+
+    Use this endpoint to:
+    - Audit what was sent to which platform and when.
+    - Diagnose failed attempts.
+    - Confirm idempotent re-runs returned the existing record.
+    """
+    variant = db.query(Variant).filter(Variant.id == variant_id).first()
+    if not variant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Variant not found")
+
+    attempts = (
+        db.query(PublishAttempt)
+        .join(ScheduleSlot, PublishAttempt.slot_id == ScheduleSlot.id)
+        .filter(ScheduleSlot.variant_id == variant_id)
+        .order_by(PublishAttempt.attempted_at.desc())
+        .all()
+    )
+    return attempts
