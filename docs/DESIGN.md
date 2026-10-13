@@ -18,7 +18,7 @@ Manually crafting tailored versions is time-consuming, and naive automated posti
 | Platform | Max Character Length | Min / Max Hashtags | Tone / Formatting Rules |
 |---|---|---|---|
 | **X (Twitter)** | 280 characters | 1 to 3 hashtags | Punchy, engaging hook, short sentences. |
-| **LinkedIn** | 3,000 characters | 3 to 5 hashtags | Professional, structured paragraphs, career / industry takeaway. |
+| **LinkedIn** | 3,000 characters | 3 to 10 hashtags | Professional, structured paragraphs, career / industry takeaway. |
 | **Discord / Telegram** | 2,000 characters | 0 to 2 hashtags | Direct community announcement with Markdown links and emojis. |
 
 *Variants that break character limits or hashtag bounds are rejected during validation before reaching the review queue.*
