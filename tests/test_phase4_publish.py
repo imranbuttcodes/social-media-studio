@@ -21,31 +21,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.database import Base, engine, get_db
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-
-# Test database setup (in-memory SQLite, isolated per test run)
-
-TEST_DATABASE_URL = "sqlite:///./test_phase4.db"
-
-test_engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-
-
-def override_get_db():
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-app.dependency_overrides[get_db] = override_get_db
-
-# Create all tables fresh for this test module.
-Base.metadata.create_all(bind=test_engine)
+# DB setup is handled by tests/conftest.py (shared test engine + autouse clean_db)
 
 client = TestClient(app)
 

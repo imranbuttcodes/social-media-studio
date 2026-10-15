@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timezone
+from pydantic import BaseModel
 
 from fastapi import FastAPI, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -15,8 +16,10 @@ from app.schemas import (
     VariantReviewUpdate,
     ScheduleSlotResponse,
     PublishAttemptResponse,
-    validate_platform_constraints
+    validate_platform_constraints,
 )
+from app.scheduler import get_scheduler
+from app.jobs import run_publish_job
 from app.services.generator import fetch_url_content, generate_platform_variants
 from app.publishers.factory import get_publisher
 from app.publishers.base import PublishError
@@ -350,3 +353,101 @@ def list_publish_attempts(variant_id: str, db: Session = Depends(get_db)):
         .all()
     )
     return attempts
+
+# --- Phase 5: Durable Scheduler Endpoints ---
+
+class ScheduleCreate(BaseModel):
+    scheduled_time: datetime
+
+@app.post(
+    "/api/v1/variants/{variant_id}/schedule",
+    response_model=ScheduleSlotResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Scheduling"],
+)
+def schedule_variant(
+    variant_id: str,
+    payload: ScheduleCreate,
+    db: Session = Depends(get_db),
+):
+    """Create a schedule slot and register an APScheduler job.
+
+    The slot is idempotent - if a slot with the same ``idempotency_key``
+    already exists, the existing slot is returned.
+    """
+    variant = db.query(Variant).filter(Variant.id == variant_id).first()
+    if not variant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Variant not found")
+
+    # Build deterministic idempotency key.
+    idempotency_key = f"{variant_id}_{payload.scheduled_time.strftime('%Y%m%dT%H%M%S')}"
+    # Check for existing slot.
+    existing = (
+        db.query(ScheduleSlot)
+        .filter(ScheduleSlot.variant_id == variant_id)
+        .filter(ScheduleSlot.idempotency_key == idempotency_key)
+        .first()
+    )
+    if existing:
+        return existing
+
+    if variant.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only approved variants can be scheduled for publishing.",
+        )
+    
+    # Create new slot.
+    slot = ScheduleSlot(
+        variant_id=variant_id,
+        scheduled_time=payload.scheduled_time,
+        idempotency_key=idempotency_key,
+        status="pending",
+    )
+    db.add(slot)
+    db.commit()
+    db.refresh(slot)
+    # Register APScheduler job.
+    scheduler = get_scheduler()
+    scheduler.add_job(
+        run_publish_job,
+        trigger="date",
+        run_date=payload.scheduled_time,
+        args=[variant_id, payload.scheduled_time.isoformat()],
+        id=idempotency_key,
+        replace_existing=True,
+    )
+    return slot
+
+@app.get(
+    "/api/v1/schedule",
+    response_model=List[ScheduleSlotResponse],
+    tags=["Scheduling"],
+)
+def list_schedule(db: Session = Depends(get_db)):
+    """Return all schedule slots (pending, processing, completed, failed)."""
+    return db.query(ScheduleSlot).order_by(ScheduleSlot.scheduled_time).all()
+
+@app.delete(
+    "/api/v1/schedule/{job_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Scheduling"],
+)
+def delete_schedule(job_id: str, db: Session = Depends(get_db)):
+    """Cancel a scheduled publish and delete its slot.
+
+    ``job_id`` is the ``idempotency_key`` used when the job was registered.
+    """
+    slot = db.query(ScheduleSlot).filter(ScheduleSlot.idempotency_key == job_id).first()
+    if not slot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule slot not found")
+    # Remove the APScheduler job if it exists.
+    scheduler = get_scheduler()
+    try:
+        scheduler.remove_job(job_id)
+    except Exception:
+        # If the job is already executed or missing, ignore.
+        pass
+    db.delete(slot)
+    db.commit()
+    return None
