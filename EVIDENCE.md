@@ -32,8 +32,9 @@ This document records concrete proof (command transcripts, automated test runs, 
 ---
 
 ### 4. Adapter Architecture & Swappability
-- [ ] `SocialPublisher` abstract interface implemented across real platform (Discord/Telegram) and mock platforms (Mock X, Mock LinkedIn).
-- [ ] Swapping the active publisher is controlled purely via configuration without modifying business logic.
+- [ ] `SocialPublisher` abstract interface is implemented by current mock adapters (`MockXPublisher`, `MockLinkedInPublisher`, `MockDiscordPublisher`).
+- [ ] Real Discord webhook / Telegram bot adapters are not implemented in this repository snapshot.
+- [ ] Swapping the active publisher purely via configuration is not implemented (`ACTIVE_REAL_PUBLISHER` is currently unused).
 
 #### Proof:
 *(To be recorded in Phase 4)*
@@ -60,6 +61,7 @@ This document records concrete proof (command transcripts, automated test runs, 
 
 ### 7. Publish History & Auditing
 - [ ] Every publish attempt is recorded with status, timestamp, target adapter, and live message link or mock preview.
+- [ ] Telegram publishing evidence cannot be completed yet because Telegram has validation constraints but no registered publisher adapter/generator output.
 
 #### Proof:
 *(To be recorded in Phase 5)*

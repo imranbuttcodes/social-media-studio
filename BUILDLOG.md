@@ -11,6 +11,8 @@ This log documents development decisions, architectural implementations, and AI 
   - Defined strict platform constraint profiles (character length limits, hashtag bounds, and tone rules for X, LinkedIn, Discord/Telegram).
   - Designed the `SocialPublisher` abstract base interface and planned adapter implementations (`DiscordWebhookPublisher`, `TelegramPublisher`, `MockXPublisher`, `MockLinkedInPublisher`).
   - Outlined the review workflow state machine (`draft` -> `approved` / `rejected` -> `published`) and durable scheduling with persistent SQLite job storage.
+* **Implementation status note (current repository state):**
+  - Real Discord webhook and Telegram bot adapters are not implemented; publishing uses mock adapters only (`MockXPublisher`, `MockLinkedInPublisher`, `MockDiscordPublisher`).
 * **AI Assistance:**
   - Assisted in structuring the system design document (`docs/DESIGN.md`) and adapter architecture patterns.
   - Formulated constraint profiles to prevent oversized or malformed posts before human review.
