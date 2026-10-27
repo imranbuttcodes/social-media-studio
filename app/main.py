@@ -354,7 +354,27 @@ def list_publish_attempts(variant_id: str, db: Session = Depends(get_db)):
     )
     return attempts
 
+
+@app.get(
+    "/api/v1/history",
+    response_model=List[PublishAttemptResponse],
+    tags=["Publishing"],
+)
+def get_publish_history(db: Session = Depends(get_db)):
+    """
+    Global publish history across every variant and platform, ordered most-recent first.
+
+    Use this to audit all successful deliveries and failed attempts in one view.
+    """
+    return (
+        db.query(PublishAttempt)
+        .order_by(PublishAttempt.attempted_at.desc())
+        .all()
+    )
+
+
 # --- Phase 5: Durable Scheduler Endpoints ---
+
 
 class ScheduleCreate(BaseModel):
     scheduled_time: datetime

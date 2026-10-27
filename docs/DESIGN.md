@@ -1,15 +1,15 @@
 # Design Document: Social Media Studio
 
 ## 1. Problem Statement
-Content creators and marketing teams frequently publish long-form blog articles and need to distribute them across multiple social media platforms (X/Twitter, LinkedIn, Discord/Telegram). 
+Content creators and marketing teams frequently publish long-form blog articles and need to distribute them across multiple social media platforms (X/Twitter, LinkedIn, Discord/Telegram).
 
 Manually crafting tailored versions is time-consuming, and naive automated posting systems present critical operational risks:
-1. **Rule Violations:** Different platforms enforce strict, distinct constraints (e.g., character limits, hashtag formatting, conversational vs professional tone).
+1. **Rule Violations:** Different platforms enforce strict, distinct constraints (character limits, hashtag formatting, tone rules).
 2. **Unreviewed Content Leaks:** Automated drafts must never bypass human editorial review.
-3. **Double-Posting Glitches:** Network timeouts and worker retries often publish identical posts multiple times to client feeds.
-4. **Fragile Scheduling:** Memory-based schedulers lose pending campaigns when workers restart or deploy.
+3. **Double-Posting Glitches:** Network timeouts and retries often publish identical posts multiple times.
+4. **Fragile Scheduling:** Memory-based schedulers lose pending campaigns when workers restart.
 
-**Social Media Studio** solves this with automated variant generation, constraint validation, a gated review workflow, durable SQLite-backed scheduling, and an adapter publishing layer with idempotency guarantees.
+**Social Media Studio** solves this with automated variant generation, constraint validation, a gated review workflow, durable SQLite-backed scheduling, and a pluggable adapter publishing layer with idempotency guarantees.
 
 ---
 
@@ -18,8 +18,9 @@ Manually crafting tailored versions is time-consuming, and naive automated posti
 | Platform | Max Character Length | Min / Max Hashtags | Tone / Formatting Rules |
 |---|---|---|---|
 | **X (Twitter)** | 280 characters | 1 to 3 hashtags | Punchy, engaging hook, short sentences. |
-| **LinkedIn** | 3,000 characters | 3 to 10 hashtags | Professional, structured paragraphs, career / industry takeaway. |
-| **Discord / Telegram** | 2,000 characters | 0 to 2 hashtags | Direct community announcement with Markdown links and emojis. |
+| **LinkedIn** | 3,000 characters | 3 to 10 hashtags | Professional, structured paragraphs, career/industry takeaway. |
+| **Discord** | 2,000 characters | 0 to 2 hashtags | Direct community announcement with Markdown links and emojis. |
+| **Telegram** | 4,096 characters | 0 to 3 hashtags | Telegram channel announcement. |
 
 *Variants that break character limits or hashtag bounds are rejected during validation before reaching the review queue.*
 
@@ -36,10 +37,10 @@ Manually crafting tailored versions is time-consuming, and naive automated posti
 
 ### `variants`
 * `id` (VARCHAR / UUID, Primary Key)
-* `post_id` (VARCHAR, Foreign Key -> `posts.id`, Indexed)
+* `post_id` (VARCHAR, Foreign Key → `posts.id`)
 * `platform` (VARCHAR) — `x`, `linkedin`, `discord`, `telegram`
 * `content` (TEXT, Non-null)
-* `hashtags` (TEXT, JSON array of strings)
+* `hashtags` (TEXT, JSON-encoded array of strings)
 * `status` (VARCHAR) — `draft`, `approved`, `rejected`, `published`
 * `review_notes` (TEXT, Nullable)
 * `created_at` (TIMESTAMP)
@@ -47,17 +48,18 @@ Manually crafting tailored versions is time-consuming, and naive automated posti
 
 ### `schedule_slots`
 * `id` (VARCHAR / UUID, Primary Key)
-* `variant_id` (VARCHAR, Foreign Key -> `variants.id`, Indexed)
-* `scheduled_time` (TIMESTAMP, Indexed)
-* `idempotency_key` (VARCHAR, Unique, Indexed)
+* `variant_id` (VARCHAR, Foreign Key → `variants.id`)
+* `scheduled_time` (TIMESTAMP)
+* `idempotency_key` (VARCHAR, Unique) — format: `{variant_id}_{YYYYMMDDTHHMMSS}`
 * `status` (VARCHAR) — `pending`, `processing`, `completed`, `failed`
+* `created_at` (TIMESTAMP)
 
-### `publish_attempts` (Publish History)
+### `publish_attempts` (Audit Log)
 * `id` (VARCHAR / UUID, Primary Key)
-* `slot_id` (VARCHAR, Foreign Key -> `schedule_slots.id`, Indexed)
-* `adapter_name` (VARCHAR) — `discord`, `telegram`, `mock_x`, `mock_linkedin`
+* `slot_id` (VARCHAR, Foreign Key → `schedule_slots.id`)
+* `adapter_name` (VARCHAR) — e.g. `mock_x`, `mock_linkedin`, `mock_discord`
 * `status` (VARCHAR) — `success`, `failed`
-* `response_data` (TEXT, Nullable — contains message ID / preview)
+* `response_data` (TEXT, Nullable — JSON with `platform_message_id`, `preview_url`)
 * `attempted_at` (TIMESTAMP)
 
 ---
@@ -69,45 +71,60 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any
 
 class SocialPublisher(ABC):
+    adapter_name: str = "base"
+
     @abstractmethod
-    async def publish(self, content: str, idempotency_key: str) -> Dict[str, Any]:
+    async def publish(self, content: str, hashtags: list[str], idempotency_key: str) -> Dict[str, Any]:
         """
         Publishes content to the designated platform.
-        Must guarantee idempotency: calling publish with the same
-        idempotency_key must never produce duplicate messages.
+        Raises PublishError on failure.
+        Returns a dict with: platform_message_id, preview_url, adapter.
         """
         pass
 ```
 
-### Implementations:
-1. `DiscordWebhookPublisher`: Publishes real messages via Discord Webhook HTTP POST.
-2. `TelegramBotPublisher`: Publishes real messages to a Telegram channel/chat.
-3. `MockXPublisher`: Validates payload and stores simulated tweet preview in DB.
-4. `MockLinkedInPublisher`: Validates payload and stores simulated post preview in DB.
+### Implementations
 
-*Swapping adapters is controlled through configuration (`ACTIVE_REAL_PUBLISHER`), requiring zero changes to core publishing code.*
+| Adapter Class           | Platform          | Description                                                |
+|-------------------------|-------------------|------------------------------------------------------------|
+| `MockXPublisher`        | x                 | Validates constraints, returns simulated tweet preview     |
+| `MockLinkedInPublisher` | linkedin          | Validates constraints, returns simulated post preview      |
+| `MockDiscordPublisher`  | discord, telegram | Validates constraints, returns simulated channel message   |
+
+> **Note on Real Adapters:** X and LinkedIn do not offer affordable public API access. Discord and Telegram delivery is proven via Mock Adapters that enforce the same constraint validation and idempotency guarantees as real adapters would. Swapping to a live adapter in a future phase requires changing `app/publishers/factory.py` only — zero changes to any endpoint or job runner.
 
 ---
 
 ## 5. API Surface
 
-* `POST /api/v1/posts` — Ingest article via URL or raw Markdown.
-* `POST /api/v1/posts/{id}/generate` — Generate platform variants using constraint validation.
-* `GET /api/v1/variants` — List variants (filter by status: `draft`, `approved`, etc.).
-* `PATCH /api/v1/variants/{id}/status` — Review workflow: transition variant to `approved` or `rejected`.
-* `POST /api/v1/variants/{id}/schedule` — Schedule an approved variant. *Returns 400 Bad Request if variant is still `draft` or `rejected`.*
-* `GET /api/v1/history` — View full publish history and delivered message previews.
+| Method   | Endpoint                              | Description                                                   |
+|----------|---------------------------------------|---------------------------------------------------------------|
+| `POST`   | `/api/v1/posts`                       | Ingest article via URL or raw Markdown                        |
+| `GET`    | `/api/v1/posts/{id}`                  | Retrieve a stored post                                        |
+| `POST`   | `/api/v1/posts/{id}/generate`         | Generate platform variants with constraint validation         |
+| `GET`    | `/api/v1/variants`                    | List variants, optional `?status=` filter                     |
+| `GET`    | `/api/v1/variants/{id}`               | Get a single variant                                          |
+| `PATCH`  | `/api/v1/variants/{id}/status`        | Review workflow: transition variant status                    |
+| `POST`   | `/api/v1/variants/{id}/publish`       | On-demand publish of an approved variant                      |
+| `GET`    | `/api/v1/variants/{id}/attempts`      | All publish attempts for a specific variant                   |
+| `POST`   | `/api/v1/variants/{id}/schedule`      | Schedule approved variant — returns 400 if not approved       |
+| `GET`    | `/api/v1/schedule`                    | List all schedule slots                                       |
+| `DELETE` | `/api/v1/schedule/{job_id}`           | Cancel a scheduled job and delete its slot                    |
+| `GET`    | `/api/v1/history`                     | Global publish history across all variants                    |
+| `GET`    | `/health`                             | Health check                                                  |
 
 ---
 
 ## 6. Durable Scheduling & Idempotency Strategy
-* Scheduling runs via `APScheduler` backed by SQLite storage (`apscheduler_jobs` table). Pending jobs survive server restarts.
-* Each publish action uses an `idempotency_key = f"{variant_id}_{scheduled_time}"`.
-* Before firing, the publisher checks `publish_attempts`. If a success record exists for that key, publishing is bypassed safely.
+
+* Scheduling runs via `APScheduler` (`BackgroundScheduler`) backed by `SQLAlchemyJobStore` (`scheduler.db`). Pending jobs survive server restarts.
+* Each publish action derives: `idempotency_key = f"{variant_id}_{scheduled_time.strftime('%Y%m%dT%H%M%S')}"`
+* Before firing, `run_publish_job` checks `publish_attempts` for an existing `success` record. If found, the adapter is **not called again** — existing record returned unchanged.
+* `ScheduleSlot` creation is also idempotent: scheduling the same variant at the same time returns the existing slot, not a duplicate.
 
 ---
 
 ## 7. Explicit Non-Goals
-1. **No Real Twitter/X or LinkedIn OAuth Tokens:** High-friction paid API tiers are avoided; these platforms are proven via robust Mock Adapters.
-2. **No Image Generation / Video Processing:** The pipeline strictly focuses on text, formatting, hooks, and hashtags.
-3. **No Complex Multi-user Permission Roles:** Focuses on the single editor review workflow.
+1. **No Real Twitter/X or LinkedIn API Tokens:** Avoided due to paid API tiers. Proven via Mock Adapters.
+2. **No Image Generation / Video Processing:** Pipeline focuses on text, formatting, hooks, and hashtags.
+3. **No Multi-user Permission Roles:** Single editor review workflow.
